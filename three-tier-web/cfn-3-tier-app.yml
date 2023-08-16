@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template deploys a CloudFront distribution with HTTPS enabled and associates it with a Web 
+  Application Firewall (WAF) to help protect against web attacks. Customize the WAF rules as needed to match your security requirements.
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-08a52ddb321b32a8c
+    us-west-2:
+      AMI: ami-04e35eeae7a7c5883
+Parameters:
+  VPCName:
+    Description: The name of the VPC
+    Type: String
+  AvailabilityZones:
+    Description: A list of Availability Zones
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+  SSHCidrIp:
+    Description: CIDR IP range for SSH access
+    Type: String
+
+
+Resources:
+  # Provision a VPC with a /16 CIDR block and enable DNS hostnames. This has the following number of ip addresses: 65,536
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: stxproject
+          Value: myproject
+
+  # Internet Gateway to allow the VPC to connect to the Internet
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${VPCName}-IGW"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !Ref AvailabilityZones ]
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidrIp
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Web Application Firewall to be used with CloudFront
+  MyWAF:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: MyRule
+        SampledRequestsEnabled: true
+      Name: MyWAF
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Description: My WAF
+
+
+  # EC2 Launch Template
+  MyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: FlaskAppTemplate
+      LaunchTemplateData:
+        InstanceType: t2.micro
+        ImageId: !FindInMap [ RegionMap, !Ref "AWS::Region", AMI ]
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        # SubnetId: !Ref PublicSubnet1
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            sudo yum install python3 -y
+            python3 -m venv myenv
+            source myenv/bin/activate
+            pip install flask gunicorn
+            echo "from flask import Flask
+            app = Flask(__name__)
+
+            @app.route('/')
+            def hello_world():
+                return '<h1>Hello, World!</h1>'
+            
+            @app.route('/welcome')
+            def hello_world():
+                return '<h1>Welcome to my page!</h1>'
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)" > app.py
+            gunicorn -w 4 -b 0.0.0.0:80 app:app
+
+  # EC2 Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      LaunchTemplate:
+        LaunchTemplateId: !GetAtt MyLaunchTemplate.LaunchTemplateId
+        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+
+  # Update TargetGroup to remove the Targets section
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Application Load Balancer
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  # Lambda execution role for Lambda@Edge
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  # Lambda@Edge Function
+  ViewerRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = (event, context, callback) => {
+              const request = event.Records[0].cf.request;
+              console.log("Lambda@Edge Ran")
+              // Return the modified request
+              callback(null, request);
+          };
+      Runtime: nodejs14.x
+
+  # Version resource for your Lambda function
+  ViewerRequestFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ViewerRequestFunction
+
+  # Cloudfront Distribution with Lambda@Edge
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt ALB.DNSName
+            Id: myOrigin
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: 'http-only'
+        DefaultCacheBehavior:
+          TargetOriginId: myOrigin
+          ViewerProtocolPolicy: 'redirect-to-https'
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref ViewerRequestFunctionVersion
+          ForwardedValues:
+            QueryString: false
+        DefaultRootObject: '/'
+        WebACLId: !Ref MyWAF
+      Tags:
+        - Key: "stxproject"
+          Value: "myproject"
+Outputs:
+  CloudFrontDistributionDomain:
+    Description: The domain name of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  PublicSubnet1:
+    Description: The ID of Public Subnet 1
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2:
+    Description: The ID of Public Subnet 2
+    Value: !Ref PublicSubnet2
+
+  ViewerRequestFunction:
+    Description: The ARN of the Lambda@Edge function for viewer response
+    Value: !GetAtt ViewerRequestFunction.Arn
+
+  VPCId:
+    Description: The ID of the created VPC
+    Value: !Ref VPC
+
+  ApplicationLoadBalancer:
+    Description: The DNS of the Application Load Balancer
+    Value: !GetAtt ALB.DNSName

@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  MyPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt MyPipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: '<GITHUB_USERNAME>'
+                Repo: '<GITHUB_REPO>'
+                Branch: '<BRANCH>'
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: SourceArtifact
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref MyBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref MyDeployApplication
+                DeploymentGroupName: !Ref MyDeployGroup
+              InputArtifacts:
+                - Name: BuildArtifact
+  MyPipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+    # Role properties
+  MyBuildProject:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+    # Build properties
+  MyDeployApplication:
+    Type: 'AWS::CodeDeploy::Application'
+    Properties:
+    # Deploy application properties
+  MyDeployGroup:
+    Type: 'AWS::CodeDeploy::DeploymentGroup'
+    Properties:
+    # Deployment group properties
+Parameters:
+  GitHubToken:
+    Type: String
+    Description: 'GitHub OAuth Token'
